@@ -279,13 +279,26 @@ public class Reflection {
         return getFieldsByType(entityPlayer.getClass(), "PlayerConnection", SearchOption.ENDS).get(0).get(entityPlayer);
     }
 
+
+    private static Field findFieldInHierarchy(Class<?> start, String name) {
+        for (Class<?> c = start; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException ignored) {}
+        }
+        throw new IllegalStateException("Field '" + name + "' not found in hierarchy of " + start);
+    }
+
     public static Channel getPlayerChannel(Player player) throws Exception {
         Object channelObject;
 
         if (oldChannelMethod) {
             Object serverPlayerObj = getMethodsByReturnTypeAndName(player.getClass(), "ServerPlayer", SearchOption.ENDS, "getHandle").get(0).invoke(player),
                     serverGamePacketListenerImplObj = getFieldByName(serverPlayerObj.getClass(), "connection").get(serverPlayerObj),
-                    connectionObj = getFieldByName(serverGamePacketListenerImplObj.getClass().getSuperclass(), "connection").get(serverGamePacketListenerImplObj);
+                    connectionObj = findFieldInHierarchy(serverGamePacketListenerImplObj.getClass(), "connection")
+                    .get(serverGamePacketListenerImplObj);
             channelObject = getFieldsByType(connectionObj.getClass(), "Channel", SearchOption.ENDS).get(0).get(connectionObj);
 
         } else {

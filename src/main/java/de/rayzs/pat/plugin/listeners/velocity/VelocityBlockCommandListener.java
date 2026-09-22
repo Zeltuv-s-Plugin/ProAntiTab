@@ -3,8 +3,11 @@ package de.rayzs.pat.plugin.listeners.velocity;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.command.CommandExecuteEvent;
 import com.velocitypowered.api.command.CommandSource;
-import de.rayzs.pat.api.communication.Communicator;
+import de.rayzs.pat.plugin.logger.Logger;
+import de.rayzs.pat.plugin.system.communication.Communicator;
 import de.rayzs.pat.api.event.events.ExecuteCommandEvent;
+import de.rayzs.pat.plugin.system.subargument.SubArgument;
+import de.rayzs.pat.plugin.system.subargument.argument.Arguments;
 import de.rayzs.pat.utils.group.Group;
 import de.rayzs.pat.utils.group.GroupManager;
 import de.rayzs.pat.utils.message.MessageTranslator;
@@ -13,8 +16,8 @@ import com.velocitypowered.api.proxy.Player;
 import de.rayzs.pat.api.storage.Storage;
 import de.rayzs.pat.utils.StringUtils;
 import de.rayzs.pat.api.event.*;
+import de.rayzs.pat.utils.response.ResponseHandler;
 import de.rayzs.pat.utils.sender.CommandSender;
-import de.rayzs.pat.utils.sender.CommandSenderHandler;
 
 import java.util.List;
 
@@ -41,10 +44,12 @@ public class VelocityBlockCommandListener {
             return event;
 
         final Player player = (Player) commandSource;
-        final CommandSender sender = CommandSenderHandler.from(player);
+        final CommandSender sender = CommandSender.from(player);
         final String serverName = player.getCurrentServer().isPresent()
                 ? player.getCurrentServer().get().getServerInfo().getName()
                 : "unknown";
+
+        final String commandWithArguments = event.getCommand().startsWith("/") ? event.getCommand().substring(1) : event.getCommand();
 
         String tmpCommand = StringUtils.getFirstArg(event.getCommand());
         if (Communicator.get().hasConnectedClients() && Storage.ConfigSections.Settings.AUTO_LOWERCASE_COMMANDS.isCommand(tmpCommand)) {
@@ -53,7 +58,7 @@ public class VelocityBlockCommandListener {
 
         final String command = tmpCommand;
 
-        if (PermissionUtil.hasBypassPermission(sender, command) || Storage.Blacklist.isDisabledServer(serverName))
+        if (PermissionUtil.hasBypassPermission(sender, command, false) || Storage.Blacklist.isDisabledServer(serverName))
             return event;
 
         final String displayCommand = StringUtils.replaceTriggers(command, "", "\\", "<", ">", "&");
@@ -115,13 +120,13 @@ public class VelocityBlockCommandListener {
         }
 
         final boolean cancelBlockedCommand = Storage.ConfigSections.Settings.CANCEL_COMMAND.ENABLED;
-        final List<Group> groups = GroupManager.getPlayerGroups(sender);
+        final List<Group> groups = GroupManager.getPlayerGroups(sender, false);
 
-        boolean allowed = Storage.Blacklist.canPlayerAccessChat(sender, groups, command, serverName);
+        boolean allowed = Storage.Blacklist.canPlayerAccessChat(sender, groups, command, serverName, false);
         boolean blockedNamespace = false;
 
 
-        if (!Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender)) {
+        if (!Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender, false)) {
             blockedNamespace = cancelBlockedCommand
                     ? Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.isCommand(command)
                     : Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesAlwaysBlock(command);
@@ -137,13 +142,25 @@ public class VelocityBlockCommandListener {
 
         if (!allowed) {
             ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(
-                    player,
+                    sender,
                     event.getCommand(),
                     true,
-                    !Storage.ConfigSections.Settings.TURN_BLACKLIST_TO_WHITELIST.ENABLED);
+                    !Storage.ConfigSections.Settings.TURN_BLACKLIST_TO_WHITELIST.ENABLED
+            );
 
             if (executeCommandEvent.isBlocked()) {
                 event.setResult(CommandExecuteEvent.CommandResult.denied());
+
+                MessageTranslator.send(
+                        sender,
+                        ResponseHandler.getResponse(
+                                sender.getUniqueId(),
+                                sender.getName(),
+                                serverName,
+                                event.getCommand(),
+                                Storage.ConfigSections.Settings.CANCEL_COMMAND.BASE_COMMAND_RESPONSE.getLines()
+                        ), "%command%", StringUtils.getFirstArg(displayCommand)
+                );
 
                 if (!executeCommandEvent.doesNotify())
                     return event;
@@ -166,10 +183,47 @@ public class VelocityBlockCommandListener {
         }
 
 
-        final ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(player, event.getCommand(), false, false);
+        final ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(
+                sender,
+                event.getCommand(),
+                SubArgument.get().getExecuteHandler().handleCommandExecution(sender, event.getCommand()),
+                false
+        );
 
         if (executeCommandEvent.isBlocked()) {
+
+/*
+            if (event.getCommand().toLowerCase().contains("discord")) {
+                Logger.info("Blocked for " + player.getUsername() + " (" + command + " -> " + event.getCommand() + ")");
+                Logger.info("Groups: " + (groups.isEmpty() ? "None" : String.join(", ", groups.stream().map(Group::getGroupName).toList())));
+                Logger.info("Server: " + serverName + " (" + sender.getServerName() + ")");
+                Arguments argument = SubArgument.get().getPlayerArgument(sender);
+
+                if (argument != null) {
+                    Logger.info("Chat Arguments: " + String.join(", ", argument.CHAT_ARGUMENTS.getAllInputs()));
+                    Logger.info("Tab Arguments: " + String.join(", ", argument.TAB_ARGUMENTS.getAllInputs()));
+                } else Logger.info("Arguments: /");
+            }
+            */
+
+
             event.setResult(CommandExecuteEvent.CommandResult.denied());
+
+            MessageTranslator.send(
+                    sender,
+                    ResponseHandler.getResponse(
+                            sender.getUniqueId(),
+                            sender.getName(),
+                            serverName,
+                            event.getCommand()
+                    ),
+                    "%command%",
+                    StringUtils.replaceTriggers(
+                            commandWithArguments, "",
+                            "\\", "<", ">", "&"
+                    )
+            );
+
         }
 
         return event;

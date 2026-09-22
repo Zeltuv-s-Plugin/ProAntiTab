@@ -2,10 +2,11 @@ package de.rayzs.pat.plugin.listeners.bukkit;
 
 import java.util.List;
 
+import de.rayzs.pat.plugin.system.subargument.SubArgument;
 import de.rayzs.pat.utils.group.Group;
 import de.rayzs.pat.utils.group.GroupManager;
+import de.rayzs.pat.utils.response.ResponseHandler;
 import de.rayzs.pat.utils.sender.CommandSender;
-import de.rayzs.pat.utils.sender.CommandSenderHandler;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
@@ -27,21 +28,19 @@ public class BukkitBlockCommandListener implements Listener {
     @EventHandler (priority = EventPriority.HIGHEST)
     public void onUnknownCommandRecognition(PlayerCommandPreprocessEvent event) {
         final Player player = event.getPlayer();
-        final CommandSender sender = CommandSenderHandler.from(player);
+        final CommandSender sender = CommandSender.from(player);
         final World world = player.getWorld();
+        final boolean isOperator = player.isOp();
 
         String rawCommand = StringUtils.getFirstArg(event.getMessage()),
                 command =  rawCommand.substring(1);
 
         if (!Storage.ConfigSections.Settings.CUSTOM_UNKNOWN_COMMAND.ENABLED || event.isCancelled()) return;
 
-        if (PermissionUtil.hasBypassPermission(sender))
+        if (PermissionUtil.hasBypassPermission(sender, isOperator))
             return;
 
         if (Storage.getLoader().doesCommandExist(command))
-            return;
-
-        if (Bukkit.getHelpMap().getHelpTopic(rawCommand) != null)
             return;
 
         event.setCancelled(true);
@@ -51,7 +50,8 @@ public class BukkitBlockCommandListener implements Listener {
     @EventHandler (priority = EventPriority.LOWEST)
     public void onPlayerCommandProcess(PlayerCommandPreprocessEvent event) {
         final Player player = event.getPlayer();
-        final CommandSender sender = CommandSenderHandler.from(player);
+        final CommandSender sender = CommandSender.from(player);
+        final boolean isOperator = player.isOp();
 
         final String commandFirstArg = StringUtils.getFirstArg(event.getMessage());
 
@@ -76,13 +76,15 @@ public class BukkitBlockCommandListener implements Listener {
                 worldName = world.getName();
 
         command = command.substring(1);
+        final String commandWithArguments = command;
+
         command = StringUtils.getFirstArg(command);
 
         if (Storage.ConfigSections.Settings.HANDLE_THROUGH_PROXY.ENABLED) {
             return;
         }
 
-        if (PermissionUtil.hasBypassPermission(sender, command)) {
+        if (PermissionUtil.hasBypassPermission(sender, command, isOperator)) {
             return;
         }
 
@@ -139,12 +141,12 @@ public class BukkitBlockCommandListener implements Listener {
         }
 
         final boolean cancelBlockedCommand = Storage.ConfigSections.Settings.CANCEL_COMMAND.ENABLED;
-        final List<Group> groups = GroupManager.getPlayerGroups(sender);
+        final List<Group> groups = GroupManager.getPlayerGroups(sender, isOperator);
 
-        boolean allowed = Storage.Blacklist.canPlayerAccessChat(sender, groups, command);
+        boolean allowed = Storage.Blacklist.canPlayerAccessChat(sender, groups, command, isOperator);
         boolean blockedNamespace = false;
 
-        if (!Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender)) {
+        if (!Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender, isOperator)) {
             blockedNamespace = cancelBlockedCommand
                     ? Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.isCommand(command)
                     : Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesAlwaysBlock(command);
@@ -158,7 +160,7 @@ public class BukkitBlockCommandListener implements Listener {
 
         if (!allowed) {
             ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(
-                    player,
+                    sender,
                     event.getMessage(),
                     true,
                     !Storage.ConfigSections.Settings.TURN_BLACKLIST_TO_WHITELIST.ENABLED
@@ -166,6 +168,17 @@ public class BukkitBlockCommandListener implements Listener {
 
             if (executeCommandEvent.isBlocked()) {
                 event.setCancelled(true);
+
+                MessageTranslator.send(
+                        sender,
+                        ResponseHandler.getResponse(
+                                sender.getUniqueId(),
+                                sender.getName(),
+                                sender.getServerName(),
+                                event.getMessage(),
+                                Storage.ConfigSections.Settings.CANCEL_COMMAND.BASE_COMMAND_RESPONSE.getLines()
+                        ), "%command%", StringUtils.getFirstArg(displayCommand)
+                );
 
                 if (!executeCommandEvent.doesNotify())
                     return;
@@ -184,8 +197,30 @@ public class BukkitBlockCommandListener implements Listener {
                 return;
         }
 
-        ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(player, event.getMessage(), false, false);
-        if (executeCommandEvent.isBlocked())
+        ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(
+                sender,
+                event.getMessage(),
+                SubArgument.get().getExecuteHandler().handleCommandExecution(sender, event.getMessage()),
+                false
+        );
+
+        if (executeCommandEvent.isBlocked()) {
             event.setCancelled(true);
+
+            MessageTranslator.send(
+                    sender,
+                    ResponseHandler.getResponse(
+                            sender.getUniqueId(),
+                            sender.getName(),
+                            sender.getServerName(),
+                            event.getMessage()
+                    ),
+                    "%command%",
+                    StringUtils.replaceTriggers(
+                            commandWithArguments, "",
+                            "\\", "<", ">", "&"
+                    )
+            );
+        }
     }
 }

@@ -1,13 +1,14 @@
 package de.rayzs.pat.plugin.listeners.bungee;
 
-import de.rayzs.pat.api.communication.Communicator;
+import de.rayzs.pat.plugin.system.communication.Communicator;
 import de.rayzs.pat.api.event.events.ExecuteCommandEvent;
+import de.rayzs.pat.plugin.system.subargument.SubArgument;
 import de.rayzs.pat.utils.group.Group;
 import de.rayzs.pat.utils.group.GroupManager;
 import de.rayzs.pat.utils.permission.PermissionUtil;
 import de.rayzs.pat.utils.message.MessageTranslator;
+import de.rayzs.pat.utils.response.ResponseHandler;
 import de.rayzs.pat.utils.sender.CommandSender;
-import de.rayzs.pat.utils.sender.CommandSenderHandler;
 import net.md_5.bungee.api.event.ChatEvent;
 import net.md_5.bungee.api.plugin.Listener;
 import de.rayzs.pat.plugin.logger.Logger;
@@ -30,15 +31,16 @@ public class BungeeBlockCommandListener implements Listener {
             return;
 
         final ProxiedPlayer player = (ProxiedPlayer) connection;
-        final CommandSender sender = CommandSenderHandler.from(player);
+        final CommandSender sender = CommandSender.from(player);
         final String serverName = player.getServer().getInfo().getName();
 
         String command = event.getMessage();
 
-        if (PermissionUtil.hasBypassPermission(sender, command) || Storage.Blacklist.isDisabledServer(serverName))
+        if (PermissionUtil.hasBypassPermission(sender, command, false) || Storage.Blacklist.isDisabledServer(serverName))
             return;
 
         command = command.startsWith("/") ? command.substring(1) : command;
+        final String commandWithArguments = command;
         command = StringUtils.getFirstArg(command);
 
         if (Communicator.get().hasConnectedClients() && Storage.ConfigSections.Settings.AUTO_LOWERCASE_COMMANDS.isCommand(command)) {
@@ -102,13 +104,13 @@ public class BungeeBlockCommandListener implements Listener {
             return;
         }
 
-        final List<Group> groups = GroupManager.getPlayerGroups(sender);
+        final List<Group> groups = GroupManager.getPlayerGroups(sender, false);
         final boolean cancelBlockedCommand = Storage.ConfigSections.Settings.CANCEL_COMMAND.ENABLED;
 
-        boolean allowed = Storage.Blacklist.canPlayerAccessChat(sender, groups, command, serverName);
+        boolean allowed = Storage.Blacklist.canPlayerAccessChat(sender, groups, command, serverName, false);
         boolean blockedNamespace = false;
 
-        if (!Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender)) {
+        if (!Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender, false)) {
             blockedNamespace = cancelBlockedCommand
                     ? Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.isCommand(command)
                     : Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesAlwaysBlock(command);
@@ -122,7 +124,7 @@ public class BungeeBlockCommandListener implements Listener {
 
         if (!allowed) {
             ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(
-                    player,
+                    sender,
                     event.getMessage(),
                     true,
                     !Storage.ConfigSections.Settings.TURN_BLACKLIST_TO_WHITELIST.ENABLED
@@ -130,6 +132,17 @@ public class BungeeBlockCommandListener implements Listener {
 
             if (executeCommandEvent.isBlocked()) {
                 event.setCancelled(true);
+
+                MessageTranslator.send(
+                        sender,
+                        ResponseHandler.getResponse(
+                                sender.getUniqueId(),
+                                sender.getName(),
+                                serverName,
+                                event.getMessage(),
+                                Storage.ConfigSections.Settings.CANCEL_COMMAND.BASE_COMMAND_RESPONSE.getLines()
+                        ), "%command%", StringUtils.getFirstArg(displayCommand)
+                );
 
                 if (!executeCommandEvent.doesNotify())
                     return;
@@ -153,8 +166,30 @@ public class BungeeBlockCommandListener implements Listener {
                 return;
         }
 
-        ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(player, event.getMessage(), false, false);
-        if (executeCommandEvent.isBlocked())
+        ExecuteCommandEvent executeCommandEvent = PATEventHandler.callExecuteCommandEvents(
+                sender,
+                event.getMessage(),
+                SubArgument.get().getExecuteHandler().handleCommandExecution(sender, event.getMessage()),
+                false
+        );
+
+        if (executeCommandEvent.isBlocked()) {
             event.setCancelled(true);
+
+            MessageTranslator.send(
+                    sender,
+                    ResponseHandler.getResponse(
+                            sender.getUniqueId(),
+                            sender.getName(),
+                            serverName,
+                            event.getMessage()
+                    ),
+                    "%command%",
+                    StringUtils.replaceTriggers(
+                            commandWithArguments, "",
+                            "\\", "<", ">", "&"
+                    )
+            );
+        }
     }
 }

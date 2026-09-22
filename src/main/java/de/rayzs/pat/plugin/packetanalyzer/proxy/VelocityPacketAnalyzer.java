@@ -1,0 +1,438 @@
+package de.rayzs.pat.plugin.packetanalyzer.proxy;
+
+import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.mojang.brigadier.suggestion.SuggestionProvider;
+import com.velocitypowered.api.command.CommandSource;
+import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.proxy.protocol.MinecraftPacket;
+import com.velocitypowered.proxy.protocol.packet.*;
+import com.velocitypowered.proxy.protocol.packet.chat.session.UnsignedPlayerCommandPacket;
+
+import de.rayzs.pat.plugin.system.serverbrand.CustomServerBrand;
+import de.rayzs.pat.api.event.PATEventHandler;
+import de.rayzs.pat.api.event.events.FilteredTabCompletionEvent;
+import de.rayzs.pat.api.storage.Storage;
+import de.rayzs.pat.plugin.VelocityLoader;
+import de.rayzs.pat.plugin.listeners.velocity.VelocityBlockCommandListener;
+import de.rayzs.pat.plugin.logger.Logger;
+import de.rayzs.pat.plugin.system.subargument.SubArgument;
+import de.rayzs.pat.utils.CommandsCache;
+import de.rayzs.pat.utils.PacketUtils;
+import de.rayzs.pat.utils.Reflection;
+import de.rayzs.pat.utils.StringUtils;
+import de.rayzs.pat.utils.group.Group;
+import de.rayzs.pat.utils.group.GroupManager;
+import de.rayzs.pat.utils.message.MessageTranslator;
+import de.rayzs.pat.utils.node.ProxyCommandNodeHelper;
+import de.rayzs.pat.utils.permission.PermissionUtil;
+import de.rayzs.pat.utils.sender.CommandSender;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.ChannelPromise;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+
+public class VelocityPacketAnalyzer {
+
+    static {
+        try {
+            final String name = "minecraft:ask_server";
+
+            final Object availableCommandsPacket = AvailableCommandsPacket.class.newInstance();
+            final Class<?> packetInstanceObjClass = availableCommandsPacket.getClass();
+
+            for (Class<?> clazz : packetInstanceObjClass.getClasses()) {
+                if (clazz.getSimpleName().equals("ProtocolSuggestionProvider")) {
+                    final Object suggestionProviderObj = clazz.getConstructor(String.class).newInstance(name);
+                    final SuggestionProvider<?> suggestionProvider = (SuggestionProvider<?>) suggestionProviderObj;
+
+                    ProxyCommandNodeHelper.setDefaultSuggestionProvider(suggestionProvider);
+                    break;
+                }
+            }
+
+        } catch (Exception exception) {
+            exception.printStackTrace();
+        }
+    }
+
+    public static final ConcurrentHashMap<Player, Channel> INJECTED_PLAYERS = new ConcurrentHashMap<>();
+
+    private static final String PIPELINE_NAME = "pat-velocity-handler", HANDLER_NAME = "handler";
+    private static final HashMap<Player, String> PLAYER_INPUT_CACHE = new HashMap<>();
+
+    private static Class<?> minecraftConnectionClass, connectedPlayerConnectionClass, signedChatCommandPacketClass;
+
+    public static void injectAll() {
+        VelocityLoader.getServer().getAllPlayers().forEach(VelocityPacketAnalyzer::inject);
+    }
+
+    public static void uninjectAll() {
+        VelocityPacketAnalyzer.INJECTED_PLAYERS.keySet().forEach(VelocityPacketAnalyzer::uninject);
+        VelocityPacketAnalyzer.INJECTED_PLAYERS.clear();
+    }
+
+    public static boolean isInjected(Player player) {
+        return INJECTED_PLAYERS.containsKey(player);
+    }
+
+    public static boolean inject(Player player) {
+
+        if (connectedPlayerConnectionClass == null) {
+            connectedPlayerConnectionClass = Reflection.getClass("com.velocitypowered.proxy.connection.client.ConnectedPlayer");
+        }
+
+        if (minecraftConnectionClass == null) {
+            minecraftConnectionClass = Reflection.getClass("com.velocitypowered.proxy.connection.MinecraftConnection");
+        }
+
+        try {
+            final Object connectedPlayerObj = connectedPlayerConnectionClass.cast(player);
+            final Object minecraftConnectionObj = Reflection.getMethodsByName(connectedPlayerConnectionClass, "getConnection")
+                                                  .get(0).invoke(connectedPlayerObj);
+
+
+            final Channel channel = (Channel) Reflection.getMethodsByName(minecraftConnectionClass, "getChannel").get(0).invoke(minecraftConnectionObj);
+
+            if (channel == null) {
+                Logger.warning("Failed to inject " + player.getUsername() + "! Channel is null.");
+                return false;
+            }
+
+            if (channel.pipeline().names().contains(VelocityPacketAnalyzer.PIPELINE_NAME)) {
+                uninject(player);
+            }
+
+
+            channel.pipeline().addBefore(
+                    VelocityPacketAnalyzer.HANDLER_NAME,
+                    VelocityPacketAnalyzer.PIPELINE_NAME,
+                    new PacketDecoder(player)
+            );
+
+            VelocityPacketAnalyzer.INJECTED_PLAYERS.put(player, channel);
+
+        } catch (NoSuchElementException noSuchElementException) {
+            Logger.warning("Failed to find 'handler' inside player pipeline! (name=" + player.getUsername() + ", uuid=" + player.getUniqueId() + ", version=" + player.getProtocolVersion() + ", brand=" + player.getClientBrand() + " )");
+            return false;
+
+        } catch (Exception exception) {
+            if (!Storage.ConfigSections.Settings.INJECTION_FAILED.SUPPRESS_EXCEPTIONS) {
+                exception.printStackTrace();
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    public static void uninject(Player player) {
+        VelocityPacketAnalyzer.PLAYER_INPUT_CACHE.remove(player);
+
+        final Channel channel = VelocityPacketAnalyzer.INJECTED_PLAYERS.get(player);
+
+        if (channel == null) {
+            return;
+        }
+
+        VelocityPacketAnalyzer.INJECTED_PLAYERS.remove(player);
+
+        channel.eventLoop().submit(() -> {
+            final ChannelPipeline pipeline = channel.pipeline();
+
+            if (pipeline.names().contains(VelocityPacketAnalyzer.PIPELINE_NAME)) {
+                pipeline.remove(VelocityPacketAnalyzer.PIPELINE_NAME);
+            }
+        });
+    }
+
+    public static String getPlayerInput(Player player) {
+        String input = PLAYER_INPUT_CACHE.get(player);
+        PLAYER_INPUT_CACHE.remove(player);
+        return input;
+    }
+
+    public static void insertPlayerInput(Player player, String text) {
+        PLAYER_INPUT_CACHE.put(player, text.toLowerCase());
+    }
+
+    private static void modifyCommands(Player player, CommandSender sender, AvailableCommandsPacket commands) {
+
+        if (commands.getRootNode().getChildren().size() == 1
+                && player.getProtocolVersion().getProtocol() > 340
+                && commands.getRootNode().getChild("args") != null
+                && commands.getRootNode().getChild("args").getChildren().isEmpty()) {
+
+            return;
+        }
+
+
+        final String serverName = sender.getServerName();
+
+        final boolean ignore = PermissionUtil.hasBypassPermission(sender, false) || Storage.Blacklist.isDisabledServer(serverName);
+        final ProxyCommandNodeHelper<CommandSource> helper = new ProxyCommandNodeHelper<>(commands.getRootNode());
+
+        final List<String> commandsAsString = new ArrayList<>();
+        commandsAsString.addAll(helper.getChildrenNames());
+
+        if (ignore) {
+            return;
+        }
+
+        final List<Group> groups = GroupManager.getPlayerGroups(sender, false);
+
+        final Map<String, CommandsCache> cache = Storage.getLoader().getPerServerCommandsCacheMap();
+        if (!cache.containsKey(serverName)) {
+            cache.put(serverName, new CommandsCache());
+        }
+
+        final CommandsCache commandsCache = cache.get(serverName);
+        commandsCache.handleCommands(commandsAsString, serverName);
+
+        final HashSet<String> playerCommands = commandsCache.getPlayerCommands(commandsAsString, sender, groups, serverName, false);
+        helper.removeIf(str -> {
+            if (str.equals("args")) {
+                return false;
+            }
+
+            return !playerCommands.contains(str);
+        });
+
+        if (Storage.ConfigSections.Settings.TAB_COMPLETION_FOR_NOT_EXISTING_COMMANDS.ENABLED) {
+            for (Group group : groups) {
+                for (String groupServerName : group.getBlacklistServerNames(serverName)) {
+                    if (Storage.isServer(groupServerName, serverName)) {
+                        for (String groupCommands : group.getAllCommands(groupServerName)) {
+                            helper.add(groupCommands, true);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (Storage.ConfigSections.Settings.CUSTOM_VERSION.ALWAYS_TAB_COMPLETABLE) {
+            Storage.ConfigSections.Settings.CUSTOM_VERSION.COMMANDS.getLines().forEach(input -> helper.add(input, false));
+        }
+
+        if (Storage.ConfigSections.Settings.CUSTOM_PLUGIN.ALWAYS_TAB_COMPLETABLE) {
+            Storage.ConfigSections.Settings.CUSTOM_PLUGIN.COMMANDS.getLines().forEach(input -> helper.add(input, false));
+        }
+
+        SubArgument.get().getCommandNodeHandler().handleCommandNode(helper, SubArgument.get().getPlayerArgument(sender));
+    }
+
+    private static void handlePluginMessageChannelsPacket(final PluginMessagePacket packet) {
+        final String channelId = packet.getChannel();
+
+        if (Storage.ConfigSections.Settings.HIDE_PLUGIN_CHANNELS.isRegisterChannel(channelId)) {
+            final ByteBuf buf = packet.content();
+            final byte[] data = new byte[buf.readableBytes()];
+            buf.getBytes(buf.readerIndex(), data);
+
+            final String dataStr = new String(data, StandardCharsets.UTF_8);
+            final String[] channels = dataStr.split("\u0000");
+
+            final List<String> filteredChannels = new ArrayList<>(Arrays.asList(channels));
+            final AtomicBoolean changedAnything = new AtomicBoolean(false);
+
+            filteredChannels.removeIf(channel -> {
+                if (!Storage.ConfigSections.Settings.HIDE_PLUGIN_CHANNELS.WHITELISTED_CHANNELS.getLines().contains(channel)) {
+                    changedAnything.set(true);
+                    return true;
+                }
+
+                return false;
+            });
+
+            if (changedAnything.get()) {
+                final ByteBuf newBuf = Unpooled.wrappedBuffer(String.join("\u0000", filteredChannels).getBytes());
+                packet.replace(newBuf);
+            }
+        }
+    }
+
+
+    private static class PacketDecoder extends ChannelDuplexHandler {
+
+        private final Player player;
+        private final CommandSender sender;
+
+        private PacketDecoder(Player player) {
+            this.player = player;
+            this.sender = CommandSender.from(player);
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (!(msg instanceof MinecraftPacket packet)) {
+                super.channelRead(ctx, msg);
+                return;
+            }
+
+            if (packet.getClass().getSimpleName().equals("SignedChatCommand")) {
+
+                try {
+                    if (signedChatCommandPacketClass == null) {
+                        signedChatCommandPacketClass = Class.forName("com.velocitypowered.proxy.crypto.SignedChatCommand");
+                    }
+
+                    Object signedChatCommandPacket = signedChatCommandPacketClass.cast(packet);
+                    Field commandField = signedChatCommandPacket.getClass().getField("command");
+                    String command = (String) commandField.get(signedChatCommandPacket);
+
+                    if (!VelocityBlockCommandListener.handleCommand(player, command).getResult().isAllowed())
+                        return;
+
+                } catch (Exception exception) {
+                    exception.printStackTrace();
+                }
+            }
+
+            if (packet instanceof PluginMessagePacket pluginMessagePacket && Storage.ConfigSections.Settings.HIDE_PLUGIN_CHANNELS.ENABLED) {
+                handlePluginMessageChannelsPacket(pluginMessagePacket);
+            }
+
+            if (packet instanceof UnsignedPlayerCommandPacket unsignedPlayerCommandPacket) {
+                if (!VelocityBlockCommandListener.handleCommand(player, unsignedPlayerCommandPacket.getCommand()).getResult().isAllowed())
+                    return;
+            }
+
+            if (packet instanceof TabCompleteRequestPacket request) {
+                if (request.getCommand() != null) {
+
+                    if (Storage.ConfigSections.Settings.PATCH_EXPLOITS.isMalicious(request.getCommand())) {
+                        MessageTranslator.send(VelocityLoader.getServer().getConsoleCommandSource(), Storage.ConfigSections.Settings.PATCH_EXPLOITS.ALERT_MESSAGE.get().replace("%player%", player.getUsername()));
+                        player.disconnect(LegacyComponentSerializer.legacyAmpersand().deserialize(Storage.ConfigSections.Settings.PATCH_EXPLOITS.KICK_MESSAGE.get()));
+                    } else {
+                        insertPlayerInput(player, request.getCommand());
+                        super.channelRead(ctx, msg);
+                    }
+                }
+            } else super.channelRead(ctx, msg);
+        }
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+            if (!(msg instanceof MinecraftPacket)) {
+                super.write(ctx, msg, promise);
+                return;
+            }
+
+            MinecraftPacket packet = (MinecraftPacket) msg;
+
+            if (packet instanceof PluginMessagePacket pluginMessagePacket) {
+                if (CustomServerBrand.get().isEnabled() && CustomServerBrand.get().isBrandTag(pluginMessagePacket.getChannel()) && !player.getCurrentServer().isPresent()) {
+                    final PacketUtils.BrandManipulate brandManipulatePacket = CustomServerBrand.get().createBrandPacket(player);
+
+                    super.write(ctx, new PluginMessagePacket(pluginMessagePacket.getChannel(), brandManipulatePacket.getByteBuf()), promise);
+                    return;
+                } else if (Storage.ConfigSections.Settings.HIDE_PLUGIN_CHANNELS.ENABLED) {
+                    handlePluginMessageChannelsPacket(pluginMessagePacket);
+                }
+
+            } else if (packet instanceof TabCompleteResponsePacket response) {
+
+                String serverName = player.getCurrentServer().get().getServer().getServerInfo().getName();
+
+                if (Storage.Blacklist.isDisabledServer(serverName)) {
+                    super.write(ctx, msg, promise);
+                    return;
+                }
+
+                if (!PermissionUtil.hasBypassPermission(sender, false) && player.getCurrentServer().isPresent()) {
+                    final List<Group> groups = GroupManager.getPlayerGroups(sender, false);
+
+                    boolean cancelsBeforeHand = false;
+                    String playerInput = getPlayerInput(player), rawPlayerInput = playerInput, server = player.getCurrentServer().get().getServerInfo().getName();
+                    int spaces = 0;
+
+                    if (playerInput.contains(" ")) {
+                        String[] split = playerInput.split(" ");
+                        spaces = split.length;
+                        if (spaces > 0) playerInput = split[0];
+                    }
+
+                    if (!playerInput.equals("/")) {
+                        cancelsBeforeHand = !Storage.Blacklist.canPlayerAccessTab(sender, groups, StringUtils.replaceFirst(playerInput, "/", ""), server, false);
+
+                        if (!cancelsBeforeHand) {
+                            cancelsBeforeHand = Storage.ConfigSections.Settings.CUSTOM_VERSION.isTabCompletable(StringUtils.replaceFirst(playerInput, "/", "")) || Storage.ConfigSections.Settings.CUSTOM_PLUGIN.isTabCompletable(StringUtils.replaceFirst(playerInput, "/", ""));
+                        }
+                    }
+
+                    final String cursor = playerInput;
+
+                    if (!cursor.startsWith("/") && spaces < 2 && player.getProtocolVersion().getProtocol() >= 754) {
+                        return;
+                    }
+
+                    if (cursor.startsWith("/")) {
+
+                        if (spaces == 0) {
+                            response.getOffers().removeIf(offer -> {
+                                String command = offer.getText();
+                                if (command.startsWith("/")) command = StringUtils.replaceFirst(command, "/", "");
+
+                                if (Storage.ConfigSections.Settings.CUSTOM_PLUGIN.isTabCompletable(command) || Storage.ConfigSections.Settings.CUSTOM_VERSION.isTabCompletable(command)) {
+                                    return false;
+                                }
+
+                                return !Storage.Blacklist.canPlayerAccessTab(sender, groups, command, player.getCurrentServer().get().getServerInfo().getName(), false);
+                            });
+
+                        } else {
+
+                            if (cancelsBeforeHand) {
+                                return;
+                            }
+
+                            final List<String> suggestionsAsString = new ArrayList<>();
+                            response.getOffers().forEach(offer -> suggestionsAsString.add(offer.getText()));
+
+                            final FilteredTabCompletionEvent filteredTabCompletionEvent = PATEventHandler.callFilteredTabCompletionEvents(
+                                    sender,
+                                    rawPlayerInput,
+                                    SubArgument.get().getTabCompleteHandler().handleTabCompletion(
+                                            sender,
+                                            rawPlayerInput,
+                                            suggestionsAsString
+                                    )
+                            );
+
+                            if (filteredTabCompletionEvent.isCancelled()) {
+                                return;
+                            }
+
+                            response.getOffers().removeIf(offer -> !filteredTabCompletionEvent.getCompletion().contains(offer.getText()));
+
+                            if (response.getOffers().isEmpty()) {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+            } else if (packet instanceof AvailableCommandsPacket commands) {
+
+                if (player.getCurrentServer().isPresent()) {
+                    modifyCommands(player, sender, commands);
+                    super.write(ctx, msg, promise);
+
+                    return;
+                }
+
+            }
+
+            super.write(ctx, msg, promise);
+        }
+    }
+}

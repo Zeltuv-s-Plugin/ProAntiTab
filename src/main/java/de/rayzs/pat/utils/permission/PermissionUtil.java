@@ -3,13 +3,11 @@ package de.rayzs.pat.utils.permission;
 import java.util.*;
 
 import de.rayzs.pat.api.storage.Storage;
-import de.rayzs.pat.plugin.logger.Logger;
 import de.rayzs.pat.utils.Reflection;
-import de.rayzs.pat.utils.adapter.GroupManagerAdapter;
+import de.rayzs.pat.utils.hooks.GroupManagerHook;
 import de.rayzs.pat.utils.group.GroupManager;
 import de.rayzs.pat.utils.sender.CommandSender;
-import de.rayzs.pat.utils.sender.CommandSenderHandler;
-import de.rayzs.pat.utils.adapter.LuckPermsAdapter;
+import de.rayzs.pat.utils.hooks.LuckPermsHook;
 
 public class PermissionUtil {
 
@@ -63,21 +61,26 @@ public class PermissionUtil {
 
     public static void setPlayerPermissions(CommandSender sender) {
         if (Storage.getPermissionPlugin() == PermissionPlugin.LUCKPERMS) {
-            LuckPermsAdapter.setPermissions(sender.getUniqueId());
+            LuckPermsHook.setPermissions(sender.getUniqueId());
         } else if (Storage.getPermissionPlugin() == PermissionPlugin.GROUPMANAGER) {
-            GroupManagerAdapter.setPermissions(sender.getUniqueId());
+            GroupManagerHook.setPermissions(sender.getUniqueId());
         } else {
-            GroupManager.getGroups().forEach(group -> group.hasPermission(sender));
+            final boolean isOperator = sender.isOperator();
+            GroupManager.getGroups().forEach(group -> group.hasPermission(sender, isOperator));
         }
     }
 
     public static void setPlayerPermissions(UUID uuid) {
         if (Storage.getPermissionPlugin() == PermissionPlugin.LUCKPERMS) {
-            LuckPermsAdapter.setPermissions(uuid);
+            LuckPermsHook.setPermissions(uuid);
         } else if (Storage.getPermissionPlugin() == PermissionPlugin.GROUPMANAGER) {
-            GroupManagerAdapter.setPermissions(uuid);
+            GroupManagerHook.setPermissions(uuid);
         } else {
-            GroupManager.getGroups().forEach(group -> group.hasPermission(uuid));
+            final CommandSender sender = CommandSender.from(uuid);
+            if (sender == null) return;
+
+            final boolean isOperator = sender.isOperator();
+            GroupManager.getGroups().forEach(group -> group.hasPermission(uuid, isOperator));
         }
     }
 
@@ -89,19 +92,38 @@ public class PermissionUtil {
     }
 
     public static void setPermission(UUID uuid, String permission, boolean permitted) {
-        PermissionMap permissionMap;
+        PermissionMap permissionMap = MAP.get(uuid);
 
-        if(!MAP.containsKey(uuid)) {
+        if(permissionMap == null) {
             permissionMap = new PermissionMap(uuid);
             MAP.put(uuid, permissionMap);
-        } else permissionMap = MAP.get(uuid);
+        }
+
+
+        final boolean isNegatedPermission = permission.charAt(0) == '-';
+
+        // Ignore because set permission is negated.
+        if (!isNegatedPermission && permissionMap.isPermitted("-" + permission)) {
+            return;
+        }
+
+        if (isNegatedPermission) {
+            final String nonNegatedPermission = permission.substring(1);
+
+            if (permissionMap.isPermitted(nonNegatedPermission)) {
+                permissionMap.setState(nonNegatedPermission, false);
+                return;
+            }
+        }
 
         permissionMap.setState(permission, permitted);
     }
 
-    public static boolean hasPermission(Object targetObj, String permission) {
-        PermissionMap permissionMap;
+    public static boolean hasPermission(final Object targetObj, final String permission, final boolean isOperator) {
+        if (isOperator) return true;
 
+
+        PermissionMap permissionMap;
         CommandSender sender = null;
         UUID uuid = null;
 
@@ -110,7 +132,7 @@ public class PermissionUtil {
         else if (targetObj instanceof CommandSender)
             sender = (CommandSender) targetObj;
         else
-            sender = CommandSenderHandler.from(targetObj);
+            sender = CommandSender.from(targetObj);
 
         // No permission plugin found!
         if (Storage.getPermissionPlugin() == PermissionPlugin.NONE) {
@@ -129,8 +151,7 @@ public class PermissionUtil {
                 return true;
             }
 
-            return sender.isOperator()
-                    || sender.hasPermission("*")
+            return sender.hasPermission("*")
                     || sender.hasPermission("proantitab.*")
                     || sender.hasPermission("proantitab." + permission);
         }
@@ -163,31 +184,33 @@ public class PermissionUtil {
                     permissionMap.setState("proantitab." + permission, sender.hasPermission("proantitab." + permission));
 
             }
-
-            if (sender.isOperator()) {
-                return true;
-            }
         }
 
-        return permissionMap.isPermitted("*") || permissionMap.isPermitted("proantitab.*") || permissionMap.isPermitted("proantitab." + permission);
+        return permissionMap.isPermitted("*")
+                || permissionMap.isPermitted("proantitab.*")
+                || permissionMap.isPermitted("proantitab." + permission);
     }
 
-    public static boolean hasBypassPermission(Object targetObj) {
+    public static boolean hasBypassPermission(Object targetObj, final boolean isOperator) {
 
         if (!Reflection.isProxyServer() && Storage.ConfigSections.Settings.HANDLE_THROUGH_PROXY.ENABLED) {
             return false;
         }
 
-        return hasPermission(targetObj, "bypass");
+        return hasPermission(targetObj, "bypass", isOperator);
     }
 
-    public static boolean hasBypassPermission(Object targetObj, String command) {
+    public static boolean hasBypassPermission(
+            final Object targetObj,
+            final String command,
+            final boolean isOperator
+    ) {
 
         if (!Reflection.isProxyServer() && Storage.ConfigSections.Settings.HANDLE_THROUGH_PROXY.ENABLED) {
             return false;
         }
 
-        if (hasBypassPermission(targetObj)) {
+        if (hasBypassPermission(targetObj, isOperator)) {
             return true;
         }
 
@@ -195,11 +218,15 @@ public class PermissionUtil {
             return false;
         }
 
-        return hasPermission(targetObj, "bypass." + command);
+        return hasPermission(targetObj, "bypass." + command, isOperator);
     }
 
-    public static boolean hasPermissionWithResponse(Object targetObj, String command) {
-        boolean permitted = hasPermission(targetObj, command);
+    public static boolean hasPermissionWithResponse(
+            final Object targetObj,
+            final String command,
+            final boolean isOperator
+    ) {
+        boolean permitted = hasPermission(targetObj, command, isOperator);
 
         if (!permitted && targetObj instanceof CommandSender) {
             String message = Storage.ConfigSections.Messages.NO_PERMISSION.MESSAGE;

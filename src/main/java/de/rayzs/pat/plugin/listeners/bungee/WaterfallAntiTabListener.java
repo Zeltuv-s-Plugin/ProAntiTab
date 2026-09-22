@@ -1,9 +1,6 @@
 package de.rayzs.pat.plugin.listeners.bungee;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import de.rayzs.pat.api.event.PATEventHandler;
 import de.rayzs.pat.api.event.events.FilteredSuggestionEvent;
@@ -13,7 +10,6 @@ import de.rayzs.pat.utils.group.Group;
 import de.rayzs.pat.utils.group.GroupManager;
 import de.rayzs.pat.utils.permission.PermissionUtil;
 import de.rayzs.pat.utils.sender.CommandSender;
-import de.rayzs.pat.utils.sender.CommandSenderHandler;
 import io.github.waterfallmc.waterfall.event.ProxyDefineCommandsEvent;
 import net.md_5.bungee.api.connection.ProxiedPlayer;
 import net.md_5.bungee.api.plugin.Command;
@@ -30,15 +26,15 @@ public class WaterfallAntiTabListener implements Listener {
         }
 
         final ProxiedPlayer player = (ProxiedPlayer) event.getReceiver();
-        final CommandSender sender = CommandSenderHandler.from(player);
+        final CommandSender sender = CommandSender.from(player);
         final String serverName = player.getServer().getInfo().getName();
 
-        if (Storage.Blacklist.isDisabledServer(serverName) || PermissionUtil.hasBypassPermission(sender)) {
+        if (Storage.Blacklist.isDisabledServer(serverName) || PermissionUtil.hasBypassPermission(sender, false)) {
             return;
         }
 
-        final List<Group> groups = GroupManager.getPlayerGroups(sender);
-        final Map<String, CommandsCache> cache = Storage.getLoader().getCommandsCacheMap();
+        final List<Group> groups = GroupManager.getPlayerGroups(sender, false);
+        final Map<String, CommandsCache> cache = Storage.getLoader().getPerServerCommandsCacheMap();
 
         if (!cache.containsKey(serverName)) {
             cache.put(serverName, new CommandsCache());
@@ -51,7 +47,7 @@ public class WaterfallAntiTabListener implements Listener {
         event.getCommands().forEach((key, value) -> commandsAsString.add(key));
         commandsCache.handleCommands(commandsAsString, serverName);
 
-        List<String> playerCommands = commandsCache.getPlayerCommands(commandsAsString, sender, groups, serverName);
+        HashSet<String> playerCommands = commandsCache.getPlayerCommands(commandsAsString, sender, groups, serverName, false);
         event.getCommands().entrySet().removeIf(command -> {
 
             if (Storage.ConfigSections.Settings.CUSTOM_PLUGIN.isTabCompletable(command.getKey()) || Storage.ConfigSections.Settings.CUSTOM_VERSION.isTabCompletable(command.getKey())) {
@@ -61,7 +57,7 @@ public class WaterfallAntiTabListener implements Listener {
             return playerCommands.contains(command.getKey());
         });
 
-        FilteredSuggestionEvent filteredSuggestionEvent = PATEventHandler.callFilteredSuggestionEvents(player, new ArrayList<>(event.getCommands().keySet()));
+        FilteredSuggestionEvent filteredSuggestionEvent = PATEventHandler.callFilteredSuggestionEvents(sender, new HashSet<>(event.getCommands().keySet()));
         if (filteredSuggestionEvent.isCancelled()) event.getCommands().clear();
 
         for (String commandName : filteredSuggestionEvent.getSuggestions()) {

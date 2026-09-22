@@ -1,0 +1,314 @@
+package de.rayzs.pat.plugin.packetanalyzer.proxy;
+
+import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.mojang.brigadier.tree.CommandNode;
+
+import com.mojang.brigadier.tree.RootCommandNode;
+import de.rayzs.pat.plugin.system.serverbrand.CustomServerBrand;
+import de.rayzs.pat.plugin.system.communication.Communicator;
+import de.rayzs.pat.api.storage.Storage;
+import de.rayzs.pat.plugin.logger.Logger;
+import de.rayzs.pat.plugin.system.subargument.SubArgument;
+import de.rayzs.pat.utils.CommandsCache;
+import de.rayzs.pat.utils.ExpireCache;
+import de.rayzs.pat.utils.group.Group;
+import de.rayzs.pat.utils.group.GroupManager;
+import de.rayzs.pat.utils.node.ProxyCommandNodeHelper;
+import de.rayzs.pat.utils.Reflection;
+import de.rayzs.pat.utils.permission.PermissionUtil;
+import de.rayzs.pat.utils.sender.CommandSender;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import io.netty.handler.codec.MessageToMessageDecoder;
+import net.md_5.bungee.api.ProxyServer;
+import net.md_5.bungee.api.connection.ProxiedPlayer;
+import net.md_5.bungee.api.plugin.Command;
+import net.md_5.bungee.protocol.PacketWrapper;
+import net.md_5.bungee.protocol.packet.Commands;
+import net.md_5.bungee.protocol.packet.PluginMessage;
+
+public class BungeePacketAnalyzer {
+
+    public static final ConcurrentHashMap<ProxiedPlayer, Channel> INJECTED_PLAYERS = new ConcurrentHashMap<>();
+
+    private static final String HANDLER_NAME = "pat-bungee-handler", PIPELINE_NAME = "packet-decoder";
+    private static final HashMap<ProxiedPlayer, Boolean> PLAYER_MODIFIED = new HashMap<>();
+    private static final ExpireCache<UUID, String> PLAYER_INPUT_CACHE = new ExpireCache<>(5, TimeUnit.SECONDS);
+
+    private static final List<String> PLUGIN_COMMANDS = new ArrayList<>();
+
+    private static Class<?> channelWrapperClass, serverConnectionClass;
+    private static List<String> PROXY_COMMANDS;
+
+    static {
+        ProxyCommandNodeHelper.setDefaultSuggestionProvider(Commands.SuggestionRegistry.ASK_SERVER);
+        loadProxyCommands();
+    }
+
+    public static void loadProxyCommands() {
+        PROXY_COMMANDS = ProxyServer.getInstance().getPluginManager().getCommands().stream().map(entry -> {
+            String key = entry.getKey();
+            return key.startsWith("/") ? key.substring(1) : key;
+        }).toList();
+    }
+
+    public static void injectAll() {
+        ProxyServer.getInstance().getPlayers().forEach(BungeePacketAnalyzer::inject);
+    }
+
+    public static void uninjectAll() {
+        BungeePacketAnalyzer.INJECTED_PLAYERS.keySet().forEach(BungeePacketAnalyzer::uninject);
+        BungeePacketAnalyzer.INJECTED_PLAYERS.clear();
+    }
+
+    public static void setPluginCommands() {
+        if(!PLUGIN_COMMANDS.isEmpty()) return;
+        ProxyServer.getInstance().getPluginManager().getCommands().stream().filter(entry -> !PLUGIN_COMMANDS.contains(entry.getKey())).forEach(entry -> PLUGIN_COMMANDS.add(entry.getKey()));
+    }
+
+    public static boolean inject(ProxiedPlayer player) {
+
+        if(channelWrapperClass == null)
+            channelWrapperClass = Reflection.getClass("net.md_5.bungee.netty.ChannelWrapper");
+
+        if(serverConnectionClass == null)
+            serverConnectionClass = Reflection.getClass("net.md_5.bungee.ServerConnection");
+
+        Object channelWrapperObj;
+        Field channelField;
+        Channel channel;
+
+        try {
+            channelField = Reflection.getFieldByName(serverConnectionClass, "ch");
+            channelWrapperObj = channelField.get(player.getServer());
+            channel = (Channel) Reflection.getFieldsByType(channelWrapperClass, "Channel", Reflection.SearchOption.ENDS).get(0).get(channelWrapperObj);
+
+            if(channel == null) {
+                Logger.warning("Failed to inject " + player.getName() + "! Channel is null.");
+                return false;
+            }
+
+            channelField.setAccessible(false);
+
+            if (channel.pipeline().names().contains(BungeePacketAnalyzer.HANDLER_NAME))
+                uninject(player);
+
+            channel.pipeline().addAfter(BungeePacketAnalyzer.PIPELINE_NAME, BungeePacketAnalyzer.HANDLER_NAME, new PacketDecoder(player));
+            BungeePacketAnalyzer.INJECTED_PLAYERS.put(player, channel);
+
+        } catch (Exception exception) {
+            if (!Storage.ConfigSections.Settings.INJECTION_FAILED.SUPPRESS_EXCEPTIONS) {
+                exception.printStackTrace();
+            }
+
+            return false;
+
+        }
+
+        return true;
+    }
+
+    public static void uninject(ProxiedPlayer player) {
+        BungeePacketAnalyzer.PLAYER_INPUT_CACHE.remove(player.getUniqueId());
+        BungeePacketAnalyzer.PLAYER_MODIFIED.remove(player);
+
+        if(BungeePacketAnalyzer.INJECTED_PLAYERS.containsKey(player)) {
+            Channel channel = BungeePacketAnalyzer.INJECTED_PLAYERS.get(player);
+            if(channel != null) {
+                BungeePacketAnalyzer.INJECTED_PLAYERS.remove(player);
+                channel.eventLoop().submit(() -> {
+                    ChannelPipeline pipeline = channel.pipeline();
+
+                    if (pipeline.names().contains(BungeePacketAnalyzer.HANDLER_NAME))
+                        pipeline.remove(BungeePacketAnalyzer.HANDLER_NAME);
+                });
+            }
+        }
+    }
+
+    public static void setPlayerInput(ProxiedPlayer player, String input) {
+        PLAYER_INPUT_CACHE.putIgnoreIfContains(player.getUniqueId(), input);
+    }
+
+    public static String getPlayerInput(ProxiedPlayer player) {
+        String input = PLAYER_INPUT_CACHE.get(player.getUniqueId());
+        PLAYER_INPUT_CACHE.remove(player.getUniqueId());
+        return input;
+    }
+
+    private static void modifyCommands(ProxiedPlayer player, CommandSender sender, Commands commands) {
+        String serverName = sender.getServerName();
+
+        final boolean ignore = PermissionUtil.hasBypassPermission(sender, false) || Storage.Blacklist.isDisabledServer(serverName);
+
+        final ProxyCommandNodeHelper helper = new ProxyCommandNodeHelper<CommandNode>(commands.getRoot());
+        final List<String> commandsAsString = new ArrayList<>(PROXY_COMMANDS);
+        commandsAsString.addAll(helper.getChildrenNames());
+
+        final List<Group> groups = ignore
+                ? Collections.emptyList()
+                : GroupManager.getPlayerGroups(sender, false);
+
+        HashSet<String> playerCommands = new HashSet<>();
+
+        if (!ignore) {
+            final Map<String, CommandsCache> cache = Storage.getLoader().getPerServerCommandsCacheMap();
+            if (!cache.containsKey(serverName)) {
+                cache.put(serverName, new CommandsCache());
+            }
+
+            final CommandsCache commandsCache = cache.get(serverName);
+            commandsCache.handleCommands(commandsAsString, serverName);
+
+            final HashSet<String> tmpPlayerCommands = commandsCache.getPlayerCommands(commandsAsString, sender, groups, serverName, false);
+
+            if (commands.getRoot().getChildren().size() != 0) {
+                helper.removeIf(str -> !tmpPlayerCommands.contains(str));
+            }
+
+            if (Storage.ConfigSections.Settings.CUSTOM_VERSION.ALWAYS_TAB_COMPLETABLE) {
+                Storage.ConfigSections.Settings.CUSTOM_VERSION.COMMANDS.getLines().forEach(input -> helper.add(input, false));
+            }
+
+            if (Storage.ConfigSections.Settings.CUSTOM_PLUGIN.ALWAYS_TAB_COMPLETABLE) {
+                Storage.ConfigSections.Settings.CUSTOM_PLUGIN.COMMANDS.getLines().forEach(input -> helper.add(input, false));
+            }
+
+            playerCommands = tmpPlayerCommands;
+        }
+
+        for (Map.Entry<String, Command> command : ProxyServer.getInstance().getPluginManager().getCommands()) {
+
+            if (ProxyServer.getInstance().getDisabledCommands().contains(command.getKey()))
+                continue;
+
+            if (commands.getRoot().getChild(command.getKey()) != null)
+                continue;
+
+            if (!command.getValue().hasPermission(player)) {
+                continue;
+            }
+
+            String commandName = command.getKey();
+            commandName = commandName.startsWith("/") ? commandName.substring(1) : commandName;
+
+            if (!ignore) {
+                boolean tabablePluginCommand = Storage.ConfigSections.Settings.CUSTOM_PLUGIN.isTabCompletable(commandName);
+                boolean tabableVersionCommand = Storage.ConfigSections.Settings.CUSTOM_VERSION.isTabCompletable(commandName);
+
+                if (!tabablePluginCommand && !tabableVersionCommand && !playerCommands.contains(commandName)) {
+                    continue;
+                }
+            }
+
+            CommandNode dummy = ProxyCommandNodeHelper.createDummyCommandNode(command.getKey());
+            commands.getRoot().addChild(dummy);
+        }
+
+
+        for (String command : PROXY_COMMANDS) {
+            if (ignore || playerCommands.contains(command)) {
+                helper.add(command, true);
+            }
+        }
+
+        if (Storage.ConfigSections.Settings.TAB_COMPLETION_FOR_NOT_EXISTING_COMMANDS.ENABLED) {
+            for (Group group : groups) {
+                for (String groupCommands : group.getAllCommands(serverName)) {
+                    helper.add(groupCommands, true);
+                }
+            }
+        }
+
+        if (!ignore) {
+            SubArgument.get().getCommandNodeHandler().handleCommandNode(helper, SubArgument.get().getPlayerArgument(sender));
+        }
+    }
+
+    public static void sendCommandsPacket() {
+        if (!Communicator.get().hasConnectedClients()) {
+            return;
+        }
+
+        for (ProxiedPlayer player : ProxyServer.getInstance().getPlayers()) {
+            if (player.getPendingConnection().getVersion() < 754)
+                continue;
+
+            final CommandSender sender = CommandSender.from(player);
+
+            RootCommandNode root = new RootCommandNode();
+            Commands packet = new Commands(root);
+
+            modifyCommands(player, sender, packet);
+            player.unsafe().sendPacket(packet);
+        }
+    }
+
+
+    private static class PacketDecoder extends MessageToMessageDecoder<PacketWrapper> {
+
+        private final ProxiedPlayer player;
+        private final CommandSender sender;
+
+        private PacketDecoder(ProxiedPlayer player) {
+            this.player = player;
+            this.sender = CommandSender.from(player);
+        }
+
+        @Override
+        protected void decode(ChannelHandlerContext channelHandlerContext, PacketWrapper wrapper, List<Object> list) {
+            if (wrapper.packet == null) {
+                list.add(wrapper);
+                return;
+            }
+
+            if (wrapper.packet instanceof PluginMessage) {
+                PluginMessage pluginMessage = (PluginMessage) wrapper.packet;
+
+                if (CustomServerBrand.get().isEnabled() && CustomServerBrand.get().isBrandTag(pluginMessage.getTag())) {
+                    return;
+                } else if (Storage.ConfigSections.Settings.HIDE_PLUGIN_CHANNELS.ENABLED) {
+                    final String channelId = pluginMessage.getTag();
+
+                    if (Storage.ConfigSections.Settings.HIDE_PLUGIN_CHANNELS.isRegisterChannel(channelId)) {
+                        final String dataStr = new String(pluginMessage.getData(), StandardCharsets.UTF_8);
+                        final String[] channels = dataStr.split("\u0000");
+
+                        final List<String> filteredChannels = new ArrayList<>(Arrays.asList(channels));
+                        final AtomicBoolean changedAnything = new AtomicBoolean(false);
+
+                        filteredChannels.removeIf(channel -> {
+                            if (!Storage.ConfigSections.Settings.HIDE_PLUGIN_CHANNELS.WHITELISTED_CHANNELS.getLines().contains(channel)) {
+                                changedAnything.set(true);
+                                return true;
+                            }
+
+                            return false;
+                        });
+
+                        if (changedAnything.get()) {
+                            pluginMessage.setData(String.join("\u0000", filteredChannels).getBytes());
+                            player.unsafe().sendPacket(pluginMessage);
+                            return;
+                        }
+                    }
+                }
+
+            } else if (wrapper.packet instanceof Commands response) {
+                modifyCommands(player, sender, response);
+                player.unsafe().sendPacket(response);
+
+                return;
+            }
+
+            list.add(wrapper);
+        }
+    }
+}

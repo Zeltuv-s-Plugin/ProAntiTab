@@ -5,6 +5,7 @@ import java.util.*;
 import de.rayzs.pat.api.event.PATEventHandler;
 import de.rayzs.pat.api.storage.Storage;
 import de.rayzs.pat.plugin.logger.Logger;
+import de.rayzs.pat.plugin.system.subargument.SubArgument;
 import de.rayzs.pat.utils.group.Group;
 import de.rayzs.pat.utils.permission.PermissionUtil;
 import de.rayzs.pat.utils.sender.CommandSender;
@@ -82,32 +83,48 @@ public class CommandsCache {
         filteredCommands = tmpFilteredCommands;
     }
 
-    public List<String> getPlayerCommands(Collection<String> unfilteredCommands, CommandSender sender, List<Group> groups) {
-        return getPlayerCommands(unfilteredCommands, sender, groups, null);
+    public HashSet<String> getPlayerCommands(
+            final Collection<String> unfilteredCommands,
+            final CommandSender sender,
+            final List<Group> groups,
+            final boolean isOperator
+    ) {
+        return getPlayerCommands(unfilteredCommands, sender, groups, null, isOperator);
     }
 
-    public List<String> getPlayerCommands(Collection<String> unfilteredCommands, CommandSender sender, List<Group> groups, String serverName) {
-        List<String> playerCommands = new LinkedList<>(unfilteredCommands);
-        List<String> localFilteredCommands = filteredCommands == null ? null : new LinkedList<>();
+    public HashSet<String> getPlayerCommands(
+            final Collection<String> unfilteredCommands,
+            final CommandSender sender,
+            final List<Group> groups,
+            final String serverName,
+            final boolean isOperator
+    ) {
+        final HashSet<String> playerCommands = new HashSet<>(unfilteredCommands);
+        final HashSet<String> localFilteredCommands = filteredCommands == null ? null : Reflection.isProxyServer()
+                ? new HashSet<>() : new HashSet<>(filteredCommands);
 
         if (localFilteredCommands == null)
             return playerCommands;
 
+        if (Reflection.isProxyServer()) {
+            // Slower and step-by-step due to some conflicts in the past with proxy servers.
 
-        final int max = filteredCommands.size();
-        for (int i = 0; i < max; i++) {
-            try {
-                String command = filteredCommands.get(i);
-                localFilteredCommands.add(command);
-            } catch (IndexOutOfBoundsException indexOutOfBoundsException) {
-                Logger.warning("Array is out of bounds " + i + "/" + max + "! " + indexOutOfBoundsException.getMessage());
-                break;
+            final int max = filteredCommands.size();
+
+            for (int i = 0; i < max; i++) {
+                try {
+                    String command = filteredCommands.get(i);
+                    localFilteredCommands.add(command);
+                } catch (IndexOutOfBoundsException indexOutOfBoundsException) {
+                    //Logger.warning("Array is out of bounds " + i + "/" + max + "! " + indexOutOfBoundsException.getMessage());
+                    break;
+                }
             }
         }
 
 
-        if (!PermissionUtil.hasBypassPermission(sender)) {
-            boolean hasNamespaceBypass = Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender);
+        if (!PermissionUtil.hasBypassPermission(sender, isOperator)) {
+            boolean hasNamespaceBypass = Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.doesBypass(sender, isOperator);
 
             playerCommands.removeIf(command -> {
                 if (!hasNamespaceBypass && Storage.ConfigSections.Settings.BLOCK_NAMESPACE_COMMANDS.isCommand(command)) {
@@ -118,14 +135,27 @@ public class CommandsCache {
                     return false;
                 }
 
-                return !Storage.Blacklist.canPlayerAccessTab(sender, groups, command, serverName);
+                return !Storage.Blacklist.canPlayerAccessTab(sender, groups, command, serverName, isOperator);
             });
 
         }
 
-        PATEventHandler.callUpdatePlayerCommandsEvents(sender, playerCommands, serverName != null);
+        final HashSet<String> serverCommands = Storage.Blacklist.Collector.collectAllServerCommands(serverName);
 
-        return playerCommands.stream().map(command -> {
+        SubArgument.get().getUpdateArgumentsHandler().updatePlayerArguments(
+                sender,
+                serverCommands,
+                serverCommands,
+                Storage.Blacklist.Collector.collectAllPlayerGroupCommands(sender, serverName)
+        );
+
+        PATEventHandler.callUpdatePlayerCommandsEvents(
+                sender,
+                playerCommands,
+                serverName != null
+        );
+
+        return new HashSet<>(playerCommands.stream().map(command -> {
             command = StringUtils.getFirstArg(command);
 
             Storage.Blacklist.BlockType type = Storage.Blacklist.BlockTypeFetcher.getType(command);
@@ -133,7 +163,7 @@ public class CommandsCache {
                 return command;
 
             return Storage.Blacklist.BlockTypeFetcher.modify(command, type);
-        }).toList();
+        }).toList());
 
     }
 
@@ -153,7 +183,7 @@ public class CommandsCache {
         filteredCommands = null;
     }
 
-    public boolean isOutdated(List<String> commands) {
-        return filteredCommands == null || !ArrayUtils.compareStringArrays(commands, allCommands);
+    public boolean isOutdated(final List<String> commands) {
+        return filteredCommands == null || !ArrayUtils.isSame(commands, allCommands);
     }
 }
